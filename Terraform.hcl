@@ -1,95 +1,151 @@
-# VPC
+provider "aws" {
+  region  = var.region
+  profile = var.aws_profile
+}
+
+##########################
+# IAM Roles e Policies
+##########################
+
+module "iam_assumable_role_admin" {
+  source = "terraform-aws-modules/iam/aws//modules/iam-assumable-role"
+  version = "5.34.0"
+
+  name                 = "eks-admin-role"
+  create_role          = true
+  role_requires_mfa    = false
+  trusted_role_services = ["ec2.amazonaws.com"]
+
+  custom_role_policy_arns = [
+    "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy",
+    "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
+    "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  ]
+}
+
+##########################
+# VPC com Subnets
+##########################
+
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
-  name    = "empresa-vpc"
-  cidr    = "10.0.0.0/16"
+  version = "5.1.1"
 
-  azs             = ["us-east-1a", "us-east-1b", "us-east-1c"]
-  private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
-  public_subnets  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
+  name = "empresa-vpc"
+  cidr = "10.0.0.0/16"
+
+  azs             = ["${var.region}a", "${var.region}b", "${var.region}c"]
+  public_subnets  = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+  private_subnets = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
 
   enable_nat_gateway = true
   single_nat_gateway = true
-
-  tags = {
-    Terraform   = "true"
-    Environment = "prod"
-  }
 }
 
-# EKS Cluster
+##########################
+# EKS Cluster com Autoscaling
+##########################
+
 module "eks" {
   source          = "terraform-aws-modules/eks/aws"
+  version         = "20.0.0"
   cluster_name    = "empresa-eks"
   cluster_version = "1.29"
-  subnets         = module.vpc.private_subnets
-  vpc_id          = module.vpc.vpc_id
 
-  node_groups = {
+  subnet_ids = module.vpc.private_subnets
+  vpc_id     = module.vpc.vpc_id
+
+  eks_managed_node_groups = {
     default = {
-      desired_capacity = 3
-      max_capacity     = 5
-      min_capacity     = 1
+      desired_size = 2
+      min_size     = 1
+      max_size     = 5
 
-      instance_type = "t3.medium"
-      key_name      = "minha-chave-ssh"
+      instance_types = ["t3.medium"]
+      capacity_type  = "ON_DEMAND"
     }
   }
 
-  tags = {
-    Environment = "prod"
-  }
+  manage_aws_auth_configmap = true
 }
 
-# ArgoCD - Helm release
-resource "helm_release" "argocd" {
-  name       = "argocd"
-  repository = "https://argoproj.github.io/argo-helm"
-  chart      = "argo-cd"
-  version    = "5.51.5"
+##########################
+# ArgoCD via Helm
+##########################
 
-  namespace = "argocd"
+resource "helm_release" "argocd" {
+  name             = "argocd"
+  namespace        = "argocd"
   create_namespace = true
 
+  repository = "https://argoproj.github.io/argo-helm"
+  chart      = "argo-cd"
+  version    = "6.7.14"
+
   values = [
-    file("${path.module}/argocd-values.yaml")
+    <<EOF
+server:
+  service:
+    type: LoadBalancer
+EOF
   ]
 
   depends_on = [module.eks]
 }
 
-# RDS - PostgreSQL
+##########################
+# RDS PostgreSQL
+##########################
+
 module "rds" {
-  source              = "terraform-aws-modules/rds/aws"
-  identifier          = "empresa-db"
-  engine              = "postgres"
-  engine_version      = "15.4"
-  instance_class      = "db.t3.medium"
-  allocated_storage   = 20
-  storage_encrypted   = true
-  name                = "empresa"
-  username            = "admin"
-  password            = "SenhaSuperSegura123"
-  port                = 5432
-  publicly_accessible = false
+  source  = "terraform-aws-modules/rds/aws"
+  version = "6.6.0"
+
+  identifier         = "empresa-db"
+  engine             = "postgres"
+  engine_version     = "15.3"
+  instance_class     = "db.t3.micro"
+  allocated_storage  = 20
+
+  name               = "empresa"
+  username           = "postgres"
+  password           = var.db_password
+  port               = 5432
+
   vpc_security_group_ids = [module.vpc.default_security_group_id]
-  subnet_ids          = module.vpc.private_subnets
+  db_subnet_group_name   = module.vpc.database_subnet_group
+  publicly_accessible    = false
 }
 
-# S3 - bucket para arquivos
+##########################
+# S3 Bucket
+##########################
+
 resource "aws_s3_bucket" "empresa_bucket" {
-  bucket = "empresa-arquivos-${random_id.sufixo.hex}"
+  bucket        = "empresa-${random_id.bucket_id.hex}"
+  force_destroy = true
 
   versioning {
     enabled = true
   }
-
-  tags = {
-    Environment = "prod"
-    Name        = "empresa-arquivos"
-  }
 }
 
-resource "random_id" "sufixo" {
+resource "random_id" "bucket_id" {
   byte_length = 4
+}
+
+##########################
+# Outputs
+##########################
+
+output "eks_cluster_endpoint" {
+  value = module.eks.cluster_endpoint
+}
+
+output "rds_endpoint" {
+  value = module.rds.db_instance_endpoint
+}
+
+output "s3_bucket" {
+  value = aws_s3_bucket.empresa_bucket.bucket
 }
